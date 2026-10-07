@@ -77,7 +77,7 @@ All secrets belong in `backend/.env`; never put them in frontend variables or co
 | `SERPAPI_MOCK_MODE` | Use local fixture responses | `false` |
 | `GROQ_API_KEY` | LLM credential | empty |
 | `GROQ_BASE_URL` | OpenAI-compatible Groq endpoint | `https://api.groq.com/openai/v1` |
-| `GROQ_MODEL` | LLM model | `llama-3.3-70b-versatile` |
+| `GROQ_MODEL` | LLM model | `any` |
 | `LLM_MAX_INPUT_PER_REQUEST` | Hard estimated input-token ceiling | `3500` |
 | `LLM_MAX_SIMPLE_CALLS` | Quick-audit LLM call ceiling | `3` |
 | `LLM_MAX_DEEP_CALLS` | Deep-audit LLM call ceiling | `4` |
