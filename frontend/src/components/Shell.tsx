@@ -15,7 +15,10 @@ export function Shell({
 
   return (
     <div className="min-h-screen bg-[#0c1216] text-[#f4f1ea]">
-      <header className="sticky top-0 z-30 border-b border-[#22303a] bg-[#0c1216]/95 backdrop-blur-sm">
+      <header 
+        className="sticky top-0 z-30 border-b border-[#22303a] backdrop-blur-sm"
+        style={{ backgroundImage: 'url(/bg.jpg)', backgroundSize: 'cover', backgroundPosition: 'center', backgroundBlendMode: 'overlay', backgroundColor: 'rgba(12, 18, 22, 0.90)' }}
+      >
         <div className="mx-auto flex max-w-7xl items-center justify-between px-5 py-3">
           <Link to="/" className="focus-ring flex items-center gap-3">
             <div className="flex h-8 w-8 items-center justify-center rounded border border-[#2d5a43] bg-[#14231b] text-emerald-400 font-mono text-xs font-bold tracking-tighter">

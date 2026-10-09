@@ -59,7 +59,7 @@ export function LandingPage() {
                 RESEARCH WORKBENCH
               </span>
               <span className="text-[#8e99a2]">·</span>
-              <span className="text-[11px] text-[#8e99a2]">Autonomous Evidence Verification</span>
+              <span className="text-[11px] text-[#8e99a2]">Evidence Verification</span>
             </div>
 
             <h1 className="mt-4 font-serif text-3xl font-medium tracking-tight text-[#f4f1ea] sm:text-5xl sm:leading-[1.15]">
@@ -113,21 +113,7 @@ export function LandingPage() {
                   </button>
                 </div>
               </div>
-
-              {/* Mode Budget Badges */}
-              <div className="mt-3.5 flex flex-wrap items-center justify-between gap-3 text-[11px] text-[#8e99a2]">
-                <div className="flex items-center gap-4">
-                  <span className="flex items-center gap-1.5">
-                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                    Quick: 8 searches max (Google, News, Scholar, Shopping)
-                  </span>
-                  <span className="hidden sm:inline text-[#22303a]">|</span>
-                  <span className="hidden sm:flex items-center gap-1.5">
-                    <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
-                    Deep: 16 searches max (+ Trends, controversy scan)
-                  </span>
-                </div>
-
+              <div className="mt-3.5 flex justify-end">
                 <button
                   type="button"
                   onClick={() => setMethod(true)}
@@ -191,9 +177,7 @@ export function LandingPage() {
               </li>
             </ul>
 
-            <div className="mt-6 border-t border-[#22303a] pt-4 text-[11px] text-[#8e99a2]/70">
-              Deterministic search limits: Quick Mode (8 calls) · Deep Mode (16 calls)
-            </div>
+
           </aside>
         </section>
       </div>

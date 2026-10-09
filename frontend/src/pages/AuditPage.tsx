@@ -132,7 +132,7 @@ export function AuditPage() {
                 {audit.companyName}
               </h1>
               <p className="mt-1.5 text-xs text-[#8e99a2]">
-                {isRunning ? "Autonomous audit in progress" : "Evidence review complete"} ·{" "}
+                {isRunning ? "Audit in progress" : "Evidence review complete"} ·{" "}
                 Created {new Date(audit.createdAt).toLocaleString()}
                 {audit.completedAt ? ` · Concluded ${new Date(audit.completedAt).toLocaleString()}` : ""}
               </p>
