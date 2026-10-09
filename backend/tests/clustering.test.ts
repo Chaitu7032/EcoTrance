@@ -28,6 +28,8 @@ describe("source clustering", () => {
     const a = map.get("1")!;
     const b = map.get("2")!;
     expect(a.clusterId).toBe(b.clusterId);
+    expect(a.independenceScore).toBeLessThan(1);
+    expect(a.independenceScore).toBeCloseTo(0.707, 2);
   });
 
   it("jaccard is 1 for identical text", () => {

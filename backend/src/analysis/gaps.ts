@@ -11,23 +11,23 @@ const GAP_CHECKS: { test: (claim: Claim, evidence: Evidence[]) => boolean; missi
   },
   {
     test: (c) => /net[- ]?zero|carbon neutral|emissions/i.test(c.text),
-    missing: "Independent verification of emissions accounting not located",
+    missing: "The automated search did not locate independent verification of emissions accounting",
   },
   {
     test: (c, ev) => /recycl/i.test(c.text) && !ev.some((e) => /\d+\s?%/.test(e.snippet + e.title)),
-    missing: "Disclosed recycled-content percentage unavailable or inconsistent",
+    missing: "The search results did not include a specific recycled-content percentage",
   },
   {
     test: (_c, ev) => !ev.some((e) => e.sourceType === "SCIENTIFIC" || e.sourceType === "ACADEMIC"),
-    missing: "Scientific literature relevant to the underlying proposition is thin or unavailable",
+    missing: "The automated query did not return relevant scientific or academic literature",
   },
   {
     test: (_c, ev) => !ev.some((e) => e.sourceType !== "OFFICIAL_COMPANY" && e.relation === "SUPPORTING"),
-    missing: "Independent supporting evidence is limited",
+    missing: "The search did not retrieve independent supporting evidence",
   },
   {
     test: (c, ev) => /packag/i.test(c.text) && !ev.some((e) => /lca|lifecycle|life cycle/i.test(e.snippet)),
-    missing: "Lifecycle assessment methodology not found",
+    missing: "Lifecycle assessment methodology was not found in the retrieved documents",
   },
   {
     test: (c) => !c.claimDate,

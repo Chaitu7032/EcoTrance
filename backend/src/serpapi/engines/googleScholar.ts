@@ -13,7 +13,9 @@ export function extractGoogleScholarHits(raw: unknown): SerpApiRawHit[] {
   for (const item of rows) {
     const r = asRecord(item);
     const pub = asRecord(r.publication_info);
-    const url = String(r.link ?? r.resources?.[0]?.link ?? "");
+    const resources = Array.isArray(r.resources) ? r.resources : [];
+    const firstResource = resources.length ? asRecord(resources[0]) : {};
+    const url = String(r.link ?? firstResource.link ?? "");
     if (!url) continue;
     hits.push({
       title: String(r.title ?? ""),

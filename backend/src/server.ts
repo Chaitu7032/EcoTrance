@@ -16,6 +16,8 @@ async function boot() {
       const sql = fs.readFileSync(path.join(here, "db/schema.sql"), "utf8");
       await pool.query(sql);
       logger.info({ msg: "database_ready" });
+      const { store } = await import("./repositories/Store.js");
+      await store.loadAllFromDb();
     } catch (err) {
       logger.warn({
         msg: "database_unavailable_using_memory",

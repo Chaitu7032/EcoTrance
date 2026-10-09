@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { env } from "../config/env.js";
 import { logger, sanitizeForLog } from "../utils/logger.js";
-import type { EvidenceRelation } from "@ecotrace/shared";
+import { validateClaimCandidate } from "../analysis/claimValidator.js";
 
 const SAFETY =
   "Use only supplied evidence. Do not invent facts, sources, dates, or unsupported claims. Distinguish contradiction from insufficient evidence.";
@@ -114,6 +114,7 @@ export class LlmClient {
     const prompt = `${SAFETY}
 
 Classify the relationship between the claim and the retrieved source. Use only the supplied text.
+Determine which parts of the claim the source supports, contradicts, or leaves unverified. Be extremely conservative: if the source does not explicitly support the specific quantity, date, or scope in the claim, classify it as INSUFFICIENT or PARTIALLY_SUPPORTING. Do not fabricate passages, URLs, dates, or conclusions.
 
 Claim: ${input.claim}
 Evidence title: ${input.title}
@@ -122,7 +123,7 @@ Source type: ${input.sourceType}
 Date: ${input.date ?? "unknown"}
 
 Return JSON only:
-{"relation":"SUPPORTING|CONTRADICTING|MIXED|IRRELEVANT|INSUFFICIENT","confidence":0-1,"reason":"..."}`;
+{"relation":"SUPPORTING|CONTRADICTING|MIXED|IRRELEVANT|INSUFFICIENT","confidence":0-1,"reason":"concise evidence-specific rationale grounded in the source text"}`;
     const parsed = await this.completeJson(prompt);
     const result = relationSchema.safeParse(parsed);
     if (!result.success) {
@@ -132,7 +133,7 @@ Return JSON only:
     return result.data;
   }
 
-  async extractClaims(company: string, documents: { title: string; snippet: string; url: string }[]): Promise<
+  async extractClaims(company: string, documents: { title: string; snippet: string; url: string; sourceName?: string }[]): Promise<
     z.infer<typeof claimsSchema>["claims"]
   > {
     if (!this.enabled()) return heuristicClaims(company, documents);
@@ -142,7 +143,9 @@ Return JSON only:
       .join("\n\n");
     const prompt = `${SAFETY}
 
-Extract environmental or sustainability claims attributed to ${company} from the supplied search snippets only. Do not invent claims that are not suggested by the snippets.
+Extract specific, testable environmental or sustainability claims attributed to ${company} from the supplied search snippets only.
+Do NOT extract questions, article titles, navigation links, slogans, or incomplete allegations.
+Every claim must have a testable proposition (e.g. emissions target, recycled content percentage, renewable energy target, or specific allegation).
 
 ${corpus}
 
@@ -151,7 +154,21 @@ Return JSON:
     const parsed = await this.completeJson(prompt);
     const result = claimsSchema.safeParse(parsed);
     if (!result.success) throw new Error("LLM malformed JSON rejected");
-    return result.data.claims;
+    const { validateClaimCandidate } = await import("../analysis/claimValidator.js");
+    const validClaims = result.data.claims
+      .map((c) => {
+        const v = validateClaimCandidate(c.text, company, c.sourceUrl, c.sourceName);
+        if (!v.isValid) return null;
+        return {
+          ...c,
+          text: v.cleanText,
+          category: v.category,
+          specificity: v.specificityScore,
+        };
+      })
+      .filter((c): c is NonNullable<typeof c> => c !== null);
+
+    return validClaims.length ? validClaims : heuristicClaims(company, documents);
   }
 
   async decomposeClaim(claim: string, category: string): Promise<z.infer<typeof subclaimsSchema>["subclaims"]> {
@@ -177,12 +194,12 @@ Return JSON:
     }
     const prompt = `${SAFETY}
 
-Write a short, careful explanation of why the claim received status ${status}. Use only these evidence observations. Do not accuse the company of greenwashing or illegal conduct.
+Write a concise, evidence-specific rationale explaining why the claim received status ${status}. Ground your explanation strictly in the stored source content provided in the observations. Do not use generic explanations. Never fabricate passages, URLs, dates, or conclusions. Do not accuse the company of greenwashing or illegal conduct.
 
 Claim: ${claim}
 Observations:\n- ${bullets.join("\n- ")}
 
-Return JSON: {"reason":"..."}`;
+Return JSON: {"reason":"concise explanation grounded in the observations"}`;
     const parsed = await this.completeJson(prompt);
     const rec = parsed as Record<string, unknown>;
     if (typeof rec.reason !== "string") throw new Error("LLM malformed JSON rejected");
@@ -297,7 +314,7 @@ export function heuristicRelation(input: {
 }): RelationClassification {
   const text = `${input.title} ${input.snippet}`.toLowerCase();
   const claim = input.claim.toLowerCase();
-  const conflictWords = /(greenwash|misleading|false|lawsuit|probe|overstat|criticism|not actually|failed to|accused)/i;
+  const conflictWords = /(greenwash|misleading|false|lawsuit|probe|overstat|criticism|criticized|critics?|questioned|questions remain|not actually|failed to|accused)/i;
   const supportWords = /(achiev|certified|verified|uses recycled|renewable|reduced|net-zero|report)/i;
   const overlap = claim
     .split(/\s+/)
@@ -323,43 +340,44 @@ export function heuristicClaims(
   company: string,
   documents: { title: string; snippet: string; url: string; sourceName?: string }[],
 ): z.infer<typeof claimsSchema>["claims"] {
-  const patterns: { re: RegExp; category: z.infer<typeof claimsSchema>["claims"][number]["category"] }[] = [
-    { re: /carbon neutral|net[- ]?zero|emissions/i, category: "CARBON" },
-    { re: /renewable energy|100% renewable|clean energy/i, category: "ENERGY" },
-    { re: /recycled (polyester|material|content)|recycl/i, category: "RECYCLING" },
-    { re: /packaging/i, category: "PACKAGING" },
-    { re: /water/i, category: "WATER" },
-    { re: /waste/i, category: "WASTE" },
-    { re: /supply chain/i, category: "SUPPLY_CHAIN" },
-    { re: /biodivers/i, category: "BIODIVERSITY" },
-    { re: /climate/i, category: "CLIMATE" },
-    { re: /sustainab|environment/i, category: "GENERAL_ENVIRONMENT" },
-  ];
   const found: z.infer<typeof claimsSchema>["claims"] = [];
   const seen = new Set<string>();
+
   for (const doc of documents) {
-    const blob = `${doc.title}. ${doc.snippet}`;
-    for (const p of patterns) {
-      if (!p.re.test(blob)) continue;
-      const sentence =
-        blob.match(/[^.?!]*(?:sustainab|recycl|carbon|renewable|emission|packag|net-zero|environment)[^.?!]*[.?!]/i)?.[0] ??
-        blob.slice(0, 180);
-      const text = sentence.replace(/\s+/g, " ").trim();
-      const key = text.toLowerCase();
-      if (seen.has(key) || text.length < 24) continue;
-      seen.add(key);
-      const specificity = /\d+%|\d{4}|certified|verified/.test(text) ? 0.7 : 0.35;
+    // Split snippet into individual sentences, prioritizing substantive snippet content
+    const rawSentences = (doc.snippet || "")
+      .replace(/\s+/g, " ")
+      .split(/(?<=[.?!])\s+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length >= 20);
+
+    // Also include title as a fallback candidate sentence only if snippet has no matches
+    const candidates = [...rawSentences, doc.title.trim()];
+
+    for (const candidate of candidates) {
+      const validation = validateClaimCandidate(candidate, company, doc.url, doc.sourceName);
+      if (!validation.isValid) continue;
+
+      const normKey = validation.cleanText.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (seen.has(normKey)) continue;
+      seen.add(normKey);
+
       found.push({
-        text: `${company}: ${text}`,
-        category: p.category,
+        text: validation.cleanText,
+        category: validation.category,
         sourceUrl: doc.url,
         sourceName: doc.sourceName ?? null,
         claimDate: null,
-        specificity,
+        specificity: validation.specificityScore,
       });
+
+      if (found.length >= 8) break;
     }
+
+    if (found.length >= 8) break;
   }
-  return found.slice(0, 8);
+
+  return found;
 }
 
 export function heuristicSubclaims(
@@ -369,26 +387,7 @@ export function heuristicSubclaims(
   const cat = category as z.infer<typeof subclaimsSchema>["subclaims"][number]["category"];
   return [
     { text: claim, testQuestion: `Is the core statement supported by independent evidence?`, category: cat },
-    {
-      text: `The claim is specific about products, geography, or time period.`,
-      testQuestion: `Does evidence specify products, locations, and reporting period?`,
-      category: cat,
-    },
-    {
-      text: `A measurable quantity (percentage, volume, or certified share) is disclosed.`,
-      testQuestion: `Is a measurable quantity disclosed and consistent across sources?`,
-      category: cat,
-    },
-    {
-      text: `The environmental impact is lower than a stated alternative or baseline.`,
-      testQuestion: `Is a baseline or alternative comparison present in the evidence?`,
-      category: cat,
-    },
-    {
-      text: `Independent or scientific sources address the underlying proposition.`,
-      testQuestion: `Does non-company evidence speak to the scientific or product-level proposition?`,
-      category: cat,
-    },
+    { text: claim, testQuestion: `Does evidence specify the products, locations, period, and quantity stated?`, category: cat },
   ];
 }
 

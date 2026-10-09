@@ -23,6 +23,7 @@ export function jaccard(a: string, b: string): number {
 export function clusterSources(sources: EvidenceSource[]): Map<string, SourceCluster> {
   const clusters: SourceCluster[] = [];
   const assigned = new Map<string, string>();
+  const representativeText = new Map<string, string>();
 
   for (const src of sources) {
     const url = canonicalizeUrl(src.url);
@@ -30,8 +31,7 @@ export function clusterSources(sources: EvidenceSource[]): Map<string, SourceClu
     let matched: SourceCluster | undefined;
     for (const c of clusters) {
       const sameUrl = c.canonicalSource === url;
-      const similar =
-        jaccard(c.canonicalSource + c.domains.join(" "), src.title + " " + src.snippet) > 0.62;
+      const similar = jaccard(representativeText.get(c.clusterId) ?? "", src.title + " " + src.snippet) > 0.62;
       const syndicated = c.domains.includes(domain) && similar;
       if (sameUrl || syndicated || similar) {
         matched = c;
@@ -47,6 +47,7 @@ export function clusterSources(sources: EvidenceSource[]): Map<string, SourceClu
         independenceScore: 1,
       };
       clusters.push(matched);
+      representativeText.set(matched.clusterId, `${src.title} ${src.snippet}`);
     } else {
       if (!matched.domains.includes(domain)) matched.domains.push(domain);
       matched.similarity = Math.max(matched.similarity, jaccard(matched.canonicalSource, src.title));
@@ -55,8 +56,9 @@ export function clusterSources(sources: EvidenceSource[]): Map<string, SourceClu
   }
 
   for (const c of clusters) {
-    const uniquePublishers = new Set(c.domains).size;
-    c.independenceScore = uniquePublishers <= 1 ? 1 : 1 / Math.sqrt(c.domains.length);
+    const clusterSize = sources.filter((s) => assigned.get(s.id) === c.clusterId).length;
+    // Syndicated or multiple pages from the same cluster are discounted so duplicate/syndicated pages do not inflate independence
+    c.independenceScore = clusterSize <= 1 ? 1 : Math.round((1 / Math.sqrt(clusterSize)) * 1000) / 1000;
   }
 
   const map = new Map<string, SourceCluster>();

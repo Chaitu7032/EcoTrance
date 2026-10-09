@@ -5,7 +5,6 @@ import type {
   AuditMode,
   AuditStage,
   Claim,
-  ClaimEvent,
   Company,
   CompanyCandidate,
   CreditSnapshot,
@@ -26,10 +25,12 @@ import { freshnessBand, freshnessScore } from "../analysis/freshness.js";
 import { independenceBaseline, sourceQualityBaseline } from "../analysis/sourceType.js";
 import { determineClaimStatus } from "../analysis/statusRules.js";
 import { detectGaps } from "../analysis/gaps.js";
+import { buildClaimEvents } from "../analysis/claimEvents.js";
 import { aggregateMetrics, computeIndicators } from "../scoring/integrity.js";
+import { calculateSpecificity } from "../scoring/specificity.js";
 import { logger } from "../utils/logger.js";
 import { extractDomain, normalizeQuery } from "../utils/url.js";
-import { isMockMode } from "../config/env.js";
+import { env, isMockMode } from "../config/env.js";
 import { DEMO_COMPANY } from "../fixtures/demo.js";
 import type { EvidenceSource } from "@ecotrace/shared";
 
@@ -230,11 +231,11 @@ export class AuditOrchestrator {
       auditId,
       text: c.text,
       category: c.category,
-      sourceUrl: c.sourceUrl ?? sources[0]?.url ?? null,
-      sourceName: c.sourceName ?? sources[0]?.sourceName ?? null,
+      sourceUrl: c.sourceUrl ?? null,
+      sourceName: c.sourceName ?? null,
       discoveredAt: new Date().toISOString(),
       claimDate: c.claimDate ?? null,
-      specificityScore: c.specificity,
+      specificityScore: calculateSpecificity(c.text),
       importanceScore: Math.max(0.4, 1 - i * 0.08),
       status: "PENDING",
       integrityScore: null,
@@ -242,11 +243,31 @@ export class AuditOrchestrator {
     }));
     const subclaims: Subclaim[] = [];
     for (const claim of claims) {
-      let parts;
-      const { heuristicSubclaims } = await import("../llm/LlmClient.js");
-      parts = heuristicSubclaims(claim.text, claim.category);
+      let parts: any[] = [];
+      try {
+        parts = await llm.decomposeClaim(claim.text, claim.category);
+      } catch {
+        const { heuristicSubclaims } = await import("../llm/LlmClient.js");
+        parts = heuristicSubclaims(claim.text, claim.category);
+      }
       const take = bundle.audit.mode === "quick" ? 3 : 5;
-      for (const p of parts.slice(0, take)) {
+      
+      const mergedParts = new Map<string, any>();
+      for (const p of parts) {
+        const normKey = p.text.toLowerCase().replace(/[^a-z0-9]/g, "");
+        if (mergedParts.has(normKey)) {
+          const existing = mergedParts.get(normKey)!;
+          if (!existing.testQuestion.includes(p.testQuestion)) {
+            existing.testQuestion += `\n- ${p.testQuestion}`;
+          }
+        } else {
+          mergedParts.set(normKey, { ...p, testQuestion: `- ${p.testQuestion}` });
+        }
+      }
+      
+      const uniqueParts = Array.from(mergedParts.values());
+      
+      for (const p of uniqueParts.slice(0, take)) {
         subclaims.push({
           id: randomUUID(),
           claimId: claim.id,
@@ -275,9 +296,11 @@ export class AuditOrchestrator {
         planned.push(q);
       }
     }
+    const maxSearches = bundle.audit.mode === "quick" ? env.SIMPLE_AUDIT_MAX_SEARCHES : env.DEEP_AUDIT_MAX_SEARCHES;
+    const remainingSlots = Math.max(0, maxSearches - bundle.requests.length);
     const budget = creditManager.snapshot(auditId).remaining;
     planned.sort((a, b) => a.priority - b.priority);
-    return planned.slice(0, Math.max(4, budget - 2));
+    return planned.slice(0, Math.min(remainingSlots, budget));
   }
 
   private async runEngine(auditId: string, engine: SearchEngine, plans: PlannedQuery[]): Promise<EvidenceSource[]> {
@@ -289,9 +312,11 @@ export class AuditOrchestrator {
       return [];
     }
     for (const plan of plans) {
-      if (!creditManager.canSpend(auditId)) {
+      const currentBundle = store.must(auditId);
+      const maxSearches = currentBundle.audit.mode === "quick" ? env.SIMPLE_AUDIT_MAX_SEARCHES : env.DEEP_AUDIT_MAX_SEARCHES;
+      if (currentBundle.requests.length >= maxSearches || !creditManager.canSpend(auditId)) {
         store.updateAudit(auditId, {
-          audit: { notes: [...store.must(auditId).audit.notes, "Credit budget reached; remaining engines ran from cache only or were skipped."] },
+          audit: { notes: [...store.must(auditId).audit.notes, "Search budget reached; remaining engines ran from cache only or were skipped."] },
         });
         break;
       }
@@ -394,27 +419,7 @@ export class AuditOrchestrator {
         });
       }
 
-    const events: ClaimEvent[] = [];
-    for (const claim of bundle.claims) {
-      const dated = evidence
-        .filter((e) => e.claimId === claim.id && e.publishedAt)
-        .sort((a, b) => String(a.publishedAt).localeCompare(String(b.publishedAt)));
-      const seenEvents = new Set<string>();
-      for (const e of dated.slice(0, 5)) {
-        const eventKey = `${normalizeQuery(e.url)}|${normalizeQuery(e.title)}|${e.publishedAt ?? ""}`;
-        if (seenEvents.has(eventKey)) continue;
-        seenEvents.add(eventKey);
-        events.push({
-          id: randomUUID(),
-          claimId: claim.id,
-          eventDate: e.publishedAt,
-          text: e.title,
-          sourceUrl: e.url,
-          note: `${e.relation} via ${e.engine}`,
-        });
-      }
-    }
-
+    const events = buildClaimEvents(bundle.claims, evidence);
     store.updateAudit(auditId, { evidence, clusters: clusterList, events });
   }
 
@@ -511,36 +516,48 @@ export function buildGraph(bundle: AuditBundle): EvidenceGraph {
   const edges: EvidenceGraph["edges"] = [];
   const shownClaims = bundle.claims.slice(0, 8);
   for (const claim of shownClaims) {
-    nodes.push({
-      id: `claim:${claim.id}`,
-      type: "claim",
-      label: truncate(claim.text, 72),
-      data: { status: claim.status, integrity: claim.integrityScore, category: claim.category },
-    });
-    edges.push({
-      id: `e-${bundle.company.id}-${claim.id}`,
-      source: `company:${bundle.company.id}`,
-      target: `claim:${claim.id}`,
-      relation: "RELATES_TO",
-      label: "claim",
-      data: {},
-    });
-    const subs = bundle.subclaims.filter((s) => s.claimId === claim.id).slice(0, 4);
-    for (const sub of subs) {
+    const claimNodeId = `claim:${claim.id}`;
+    if (!nodes.some((n) => n.id === claimNodeId)) {
       nodes.push({
-        id: `sub:${sub.id}`,
-        type: "subclaim",
-        label: truncate(sub.text, 64),
-        data: { status: sub.status, question: sub.testQuestion },
+        id: claimNodeId,
+        type: "claim",
+        label: truncate(claim.text, 72),
+        data: { status: claim.status, integrity: claim.integrityScore, category: claim.category },
       });
+    }
+    const claimEdgeId = `e-${bundle.company.id}-${claim.id}`;
+    if (!edges.some((e) => e.id === claimEdgeId)) {
       edges.push({
-        id: `e-${claim.id}-${sub.id}`,
-        source: `claim:${claim.id}`,
-        target: `sub:${sub.id}`,
+        id: claimEdgeId,
+        source: `company:${bundle.company.id}`,
+        target: claimNodeId,
         relation: "RELATES_TO",
-        label: "decomposes",
+        label: "claim",
         data: {},
       });
+    }
+    const subs = bundle.subclaims.filter((s) => s.claimId === claim.id).slice(0, 4);
+    for (const sub of subs) {
+      const subNodeId = `sub:${sub.id}`;
+      if (!nodes.some((n) => n.id === subNodeId)) {
+        nodes.push({
+          id: subNodeId,
+          type: "subclaim",
+          label: truncate(sub.text, 64),
+          data: { status: sub.status, question: sub.testQuestion },
+        });
+      }
+      const subEdgeId = `e-${claim.id}-${sub.id}`;
+      if (!edges.some((e) => e.id === subEdgeId)) {
+        edges.push({
+          id: subEdgeId,
+          source: claimNodeId,
+          target: subNodeId,
+          relation: "RELATES_TO",
+          label: "decomposes",
+          data: {},
+        });
+      }
       const evs = bundle.evidence.filter((e) => e.subclaimId === sub.id).slice(0, 4);
       for (const ev of evs) {
         const evId = `ev:${ev.id}`;
@@ -559,21 +576,24 @@ export function buildGraph(bundle: AuditBundle): EvidenceGraph {
           });
         }
         const rel = ev.relation === "CONTRADICTING" ? "CONTRADICTS" : ev.relation === "SUPPORTING" ? "SUPPORTS" : "RELATES_TO";
-        edges.push({
-          id: `e-${sub.id}-${ev.id}`,
-          source: `sub:${sub.id}`,
-          target: evId,
-          relation: rel,
-          label: ev.relation.toLowerCase(),
-          data: {
-            engine: ev.engine,
-            snippet: ev.snippet,
-            date: ev.publishedAt,
-            source: ev.sourceName,
-            confidence: ev.relevanceScore,
-            why: ev.explanation,
-          },
-        });
+        const evEdgeId = `e-${sub.id}-${ev.id}`;
+        if (!edges.some((e) => e.id === evEdgeId)) {
+          edges.push({
+            id: evEdgeId,
+            source: subNodeId,
+            target: evId,
+            relation: rel,
+            label: ev.relation.toLowerCase(),
+            data: {
+              engine: ev.engine,
+              snippet: ev.snippet,
+              date: ev.publishedAt,
+              source: ev.sourceName,
+              confidence: ev.relevanceScore,
+              why: ev.explanation,
+            },
+          });
+        }
         const srcId = `src:${ev.domain}`;
         if (!nodes.some((n) => n.id === srcId)) {
           nodes.push({
@@ -583,14 +603,17 @@ export function buildGraph(bundle: AuditBundle): EvidenceGraph {
             data: { domain: ev.domain, sourceType: ev.sourceType, url: ev.url },
           });
         }
-        edges.push({
-          id: `e-${ev.id}-src`,
-          source: evId,
-          target: srcId,
-          relation: "RELATES_TO",
-          label: ev.sourceType.toLowerCase(),
-          data: { url: ev.url },
-        });
+        const srcEdgeId = `e-${ev.id}-src`;
+        if (!edges.some((e) => e.id === srcEdgeId)) {
+          edges.push({
+            id: srcEdgeId,
+            source: evId,
+            target: srcId,
+            relation: "RELATES_TO",
+            label: ev.sourceType.toLowerCase(),
+            data: { url: ev.url },
+          });
+        }
       }
     }
   }
@@ -697,8 +720,11 @@ function engineLabel(engine: SearchEngine): string {
   }
 }
 
+export { buildClaimEvents };
+
 export function demoCompanyHint(input: string): boolean {
   return normalizeQuery(input) === normalizeQuery(DEMO_COMPANY);
 }
 
 export { extractDomain };
+

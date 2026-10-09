@@ -1,6 +1,5 @@
 import type { Request, Response } from "express";
 import dns from "node:dns/promises";
-import https from "node:https";
 import { z } from "zod";
 import { orchestrator, buildGraph, renderExport } from "../services/AuditOrchestrator.js";
 import { store } from "../repositories/Store.js";
@@ -9,6 +8,10 @@ import { databaseUrl, isMockMode } from "../config/env.js";
 import { serpApiConfig } from "../config/serpapi.js";
 import { SerpApiClient, SerpApiError } from "../serpapi/SerpApiClient.js";
 import { DISCLAIMER } from "@ecotrace/shared";
+
+function routeParam(value: string | string[] | undefined): string {
+  return Array.isArray(value) ? value[0] ?? "" : value ?? "";
+}
 
 export const createAuditSchema = z.object({
   company: z.string().trim().min(2).max(120),
@@ -90,7 +93,7 @@ export async function createAudit(req: Request, res: Response): Promise<void> {
 }
 
 export function getAudit(req: Request, res: Response): void {
-  const bundle = store.getAudit(req.params.id);
+  const bundle = store.getAudit(routeParam(req.params.id));
   if (!bundle) {
     res.status(404).json({ error: "Audit not found" });
     return;
@@ -108,7 +111,7 @@ export function getAudit(req: Request, res: Response): void {
 }
 
 export function getStatus(req: Request, res: Response): void {
-  const bundle = store.getAudit(req.params.id);
+  const bundle = store.getAudit(routeParam(req.params.id));
   if (!bundle) {
     res.status(404).json({ error: "Audit not found" });
     return;
@@ -123,7 +126,7 @@ export function getStatus(req: Request, res: Response): void {
 }
 
 export function getClaims(req: Request, res: Response): void {
-  const bundle = store.getAudit(req.params.id);
+  const bundle = store.getAudit(routeParam(req.params.id));
   if (!bundle) {
     res.status(404).json({ error: "Audit not found" });
     return;
@@ -134,7 +137,7 @@ export function getClaims(req: Request, res: Response): void {
 }
 
 export function getEvidence(req: Request, res: Response): void {
-  const bundle = store.getAudit(req.params.id);
+  const bundle = store.getAudit(routeParam(req.params.id));
   if (!bundle) {
     res.status(404).json({ error: "Audit not found" });
     return;
@@ -143,7 +146,7 @@ export function getEvidence(req: Request, res: Response): void {
 }
 
 export function getGraph(req: Request, res: Response): void {
-  const bundle = store.getAudit(req.params.id);
+  const bundle = store.getAudit(routeParam(req.params.id));
   if (!bundle) {
     res.status(404).json({ error: "Audit not found" });
     return;
@@ -152,7 +155,7 @@ export function getGraph(req: Request, res: Response): void {
 }
 
 export function getTimeline(req: Request, res: Response): void {
-  const bundle = store.getAudit(req.params.id);
+  const bundle = store.getAudit(routeParam(req.params.id));
   if (!bundle) {
     res.status(404).json({ error: "Audit not found" });
     return;
@@ -161,7 +164,7 @@ export function getTimeline(req: Request, res: Response): void {
 }
 
 export function getSearchTrace(req: Request, res: Response): void {
-  const bundle = store.getAudit(req.params.id);
+  const bundle = store.getAudit(routeParam(req.params.id));
   if (!bundle) {
     res.status(404).json({ error: "Audit not found" });
     return;
@@ -170,7 +173,7 @@ export function getSearchTrace(req: Request, res: Response): void {
 }
 
 export function getMetrics(req: Request, res: Response): void {
-  const bundle = store.getAudit(req.params.id);
+  const bundle = store.getAudit(routeParam(req.params.id));
   if (!bundle) {
     res.status(404).json({ error: "Audit not found" });
     return;
@@ -180,7 +183,7 @@ export function getMetrics(req: Request, res: Response): void {
 
 export function getClaim(req: Request, res: Response): void {
   for (const bundle of store.listAudits().map((a) => store.getAudit(a.id)!)) {
-    const claim = bundle.claims.find((c) => c.id === req.params.id);
+    const claim = bundle.claims.find((c) => c.id === routeParam(req.params.id));
     if (!claim) continue;
     res.json({
       claim,
@@ -197,7 +200,7 @@ export function getClaim(req: Request, res: Response): void {
 export function getClaimEvidence(req: Request, res: Response): void {
   for (const a of store.listAudits()) {
     const bundle = store.getAudit(a.id)!;
-    const claim = bundle.claims.find((c) => c.id === req.params.id);
+    const claim = bundle.claims.find((c) => c.id === routeParam(req.params.id));
     if (!claim) continue;
     res.json({ evidence: bundle.evidence.filter((e) => e.claimId === claim.id) });
     return;
@@ -210,7 +213,7 @@ export async function reanalyzeClaim(req: Request, res: Response): Promise<void>
 }
 
 export function exportAudit(req: Request, res: Response): void {
-  const bundle = store.getAudit(req.params.id);
+  const bundle = store.getAudit(routeParam(req.params.id));
   if (!bundle) {
     res.status(404).json({ error: "Audit not found" });
     return;

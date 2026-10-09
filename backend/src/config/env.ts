@@ -46,5 +46,9 @@ export function databaseUrl(): string {
 }
 
 export function isMockMode(): boolean {
+  if (process.env.SERPAPI_MOCK_MODE !== undefined) {
+    return process.env.SERPAPI_MOCK_MODE === "true" || process.env.SERPAPI_MOCK_MODE === "1";
+  }
   return env.SERPAPI_MOCK_MODE;
 }
+
