@@ -188,7 +188,7 @@ export function AuditPage() {
         ) : null}
 
         {/* Core Methodology Metric Cards */}
-        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
           {[
             {
               label: "Claim Integrity",
@@ -212,13 +212,19 @@ export function AuditPage() {
               label: "Evidence Conflict",
               value: metrics?.evidenceConflict,
               color: metrics?.evidenceConflict && metrics.evidenceConflict > 0 ? "text-rose-400" : "text-[#8e99a2]",
-              help: "Share of polarized evidence contradicting the claim. 0% means no detected contradictions in retrieved evidence.",
+              help: "Share of polarized evidence contradicting the claim. 0% indicates no qualifying contradictions were detected in retrieved evidence, not that the claim is proven true.",
             },
             {
               label: "Claim Specificity",
               value: metrics?.claimSpecificity,
               color: "text-amber-300",
               help: "Density of verifiable metrics, baselines, target years, boundaries, and measurable propositions across claims.",
+            },
+            {
+              label: "Evidence Gap",
+              value: metrics?.evidenceGap,
+              color: metrics?.evidenceGap && metrics.evidenceGap > 50 ? "text-amber-400" : "text-emerald-400",
+              help: "Proportion of applicable verification requirements unresolved by retrieved public evidence. 0% means all identified aspects are addressed.",
             },
           ].map((item) => (
             <div

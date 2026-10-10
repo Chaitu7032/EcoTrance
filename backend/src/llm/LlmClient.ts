@@ -2,6 +2,7 @@ import { z } from "zod";
 import { env } from "../config/env.js";
 import { logger, sanitizeForLog } from "../utils/logger.js";
 import { validateClaimCandidate } from "../analysis/claimValidator.js";
+import { checkEntityMatch, checkPropositionMatch } from "../analysis/evidenceMatcher.js";
 
 const SAFETY =
   "Use only supplied evidence. Do not invent facts, sources, dates, or unsupported claims. Distinguish contradiction from insufficient evidence.";
@@ -100,7 +101,28 @@ export class LlmClient {
     const prompt = `${SAFETY}\nClassify every supplied evidence item for its claim. Return JSON only, with no omitted IDs:\n${compact}\n{"results":[{"evidenceId":"E1","relation":"SUPPORTING|CONTRADICTING|MIXED|IRRELEVANT|INSUFFICIENT","confidence":0-1,"reason":"short reason"}]}`;
     const parsed = batchRelationSchema.safeParse(await this.completeJson(prompt));
     if (!parsed.success) throw new Error("LLM malformed JSON rejected");
-    return new Map(parsed.data.results.map((r) => [r.evidenceId, { relation: r.relation, confidence: r.confidence, reason: r.reason }]));
+    const mapped = new Map<string, RelationClassification>();
+    for (const r of parsed.data.results) {
+      const orig = inputs.find((i) => i.evidenceId === r.evidenceId);
+      if (orig) {
+        let company: string | undefined;
+        const colonIdx = orig.claim.indexOf(":");
+        if (colonIdx > 0 && colonIdx < 40) company = orig.claim.slice(0, colonIdx).trim();
+        if (company) {
+          const entityCheck = checkEntityMatch(company, orig.title, orig.snippet);
+          if (!entityCheck.matches && (r.relation === "SUPPORTING" || r.relation === "MIXED")) {
+            mapped.set(r.evidenceId, {
+              relation: "IRRELEVANT",
+              confidence: 0.9,
+              reason: entityCheck.reason ?? "Source addresses an unrelated entity.",
+            });
+            continue;
+          }
+        }
+      }
+      mapped.set(r.evidenceId, { relation: r.relation, confidence: r.confidence, reason: r.reason });
+    }
+    return mapped;
   }
 
   async classifyRelation(input: {
@@ -311,29 +333,41 @@ export function heuristicRelation(input: {
   title: string;
   snippet: string;
   sourceType: string;
+  companyName?: string;
 }): RelationClassification {
-  const text = `${input.title} ${input.snippet}`.toLowerCase();
-  const claim = input.claim.toLowerCase();
-  const conflictWords = /(greenwash|misleading|false|lawsuit|probe|overstat|criticism|criticized|critics?|questioned|questions remain|not actually|failed to|accused)/i;
-  const supportWords = /(achiev|certified|verified|uses recycled|renewable|reduced|net-zero|report)/i;
-  const overlap = claim
-    .split(/\s+/)
-    .filter((w) => w.length > 4)
-    .filter((w) => text.includes(w)).length;
+  // Determine claimant company from input or claim text
+  let company = input.companyName;
+  if (!company) {
+    const colonIdx = input.claim.indexOf(":");
+    if (colonIdx > 0 && colonIdx < 50) {
+      company = input.claim.slice(0, colonIdx).trim();
+    }
+  }
 
-  if (overlap < 1 && !/(sustainab|environment|recycl|carbon|climate)/.test(text)) {
-    return { relation: "IRRELEVANT", confidence: 0.55, reason: "Snippet does not overlap with the claim language." };
+  // Check entity match first
+  if (company) {
+    const entityCheck = checkEntityMatch(company, input.title, input.snippet);
+    if (!entityCheck.matches) {
+      return {
+        relation: "IRRELEVANT",
+        confidence: 0.9,
+        reason: entityCheck.reason ?? `Source does not address ${company}.`,
+      };
+    }
   }
-  if (conflictWords.test(text) && supportWords.test(text)) {
-    return { relation: "MIXED", confidence: 0.5, reason: "Source contains both supportive language and criticism." };
-  }
-  if (conflictWords.test(text)) {
-    return { relation: "CONTRADICTING", confidence: 0.55, reason: "Source language challenges or criticizes the claim." };
-  }
-  if (supportWords.test(text) || overlap >= 2) {
-    return { relation: "SUPPORTING", confidence: 0.5, reason: "Source language aligns with the claim using retrieved wording." };
-  }
-  return { relation: "INSUFFICIENT", confidence: 0.4, reason: "Retrieved snippet is too thin to classify confidently." };
+
+  const propMatch = checkPropositionMatch(
+    input.claim,
+    input.title,
+    input.snippet,
+    (input.sourceType as any) || "OTHER",
+  );
+
+  return {
+    relation: propMatch.relation,
+    confidence: propMatch.confidence,
+    reason: propMatch.reason,
+  };
 }
 
 export function heuristicClaims(
@@ -385,10 +419,76 @@ export function heuristicSubclaims(
   category: string,
 ): z.infer<typeof subclaimsSchema>["subclaims"] {
   const cat = category as z.infer<typeof subclaimsSchema>["subclaims"][number]["category"];
-  return [
-    { text: claim, testQuestion: `Is the core statement supported by independent evidence?`, category: cat },
-    { text: claim, testQuestion: `Does evidence specify the products, locations, period, and quantity stated?`, category: cat },
-  ];
+  const out: z.infer<typeof subclaimsSchema>["subclaims"] = [];
+
+  // 1. Compound service/offering with stated environmental effect:
+  // e.g. "Tata Power offers wind, solar, hydro and thermal energy services to reduce emissions."
+  const serviceToReduceMatch = claim.match(/^(.*?\b(?:offers?|provides?|delivers?|deploys?|uses?)\b.*?)\s+\bto\s+(?:reduce|cut|lower|decrease|mitigate|achieve)\b\s*(.*)$/i);
+  if (serviceToReduceMatch) {
+    const servicePart = serviceToReduceMatch[1].trim().replace(/[\s.,;:–—-]+$/, "");
+    const effectPart = serviceToReduceMatch[2].trim().replace(/[\s.,;:–—-]+$/, "");
+    out.push({
+      text: `${servicePart}.`,
+      testQuestion: `Does verified evidence establish that the company provides or deploys the specified services or infrastructure?`,
+      category: cat,
+    });
+    out.push({
+      text: `Those activities reduce ${effectPart} in the relevant operational context.`,
+      testQuestion: `Does evidence substantiate that these activities contribute to verifiable reductions in ${effectPart}?`,
+      category: cat,
+    });
+    return out;
+  }
+
+  // 2. Targets with quantified reduction and baseline:
+  // e.g. "Tata Power aims to reduce Scope 1 greenhouse gas emissions by 70.5% per MWh by FY2037 from an FY2022 baseline"
+  const targetWithBaselineMatch = claim.match(/^(.*?\b(?:reduce|cut|halve|reach|decrease)\b.*?\d+(?:\.\d+)?%.*?\bby\s+(?:20\d{2}|fy\s?\d{2,4})\b.*?)\s+(?:from|versus|vs\.?|against)\s+(?:an?\s+)?(?:baseline\s+)?(fy\s?\d{2,4}|20\d{2})(?:.*)$/i);
+  if (targetWithBaselineMatch) {
+    const targetPart = targetWithBaselineMatch[1].trim().replace(/[\s.,;:–—-]+$/, "");
+    const baseYear = targetWithBaselineMatch[2].trim();
+    out.push({
+      text: `${targetPart}.`,
+      testQuestion: `Do official corporate filings or disclosures establish this specific quantitative target and timeline?`,
+      category: cat,
+    });
+    out.push({
+      text: `Emissions reductions are measured against a verified ${baseYear} baseline with defined accounting boundary.`,
+      testQuestion: `Is the ${baseYear} baseline emissions intensity and measurement methodology independently documented?`,
+      category: cat,
+    });
+    return out;
+  }
+
+  // 3. Dual commitments with "and":
+  // e.g. "Company targets net-zero emissions by 2045 and 100% renewable power by 2030"
+  const dualCommitmentMatch = claim.match(/^(.*?\b(?:by\s+20\d{2}|net[- ]?zero|100%)\b.*?)\s+and\s+(.*?\b(?:by\s+20\d{2}|net[- ]?zero|100%)\b.*)$/i);
+  if (dualCommitmentMatch) {
+    out.push({
+      text: `${dualCommitmentMatch[1].trim()}.`,
+      testQuestion: `Do corporate records or filings substantiate the first commitment?`,
+      category: cat,
+    });
+    out.push({
+      text: `${dualCommitmentMatch[2].trim()}.`,
+      testQuestion: `Do corporate records or filings substantiate the second commitment?`,
+      category: cat,
+    });
+    return out;
+  }
+
+  // Default atomic decomposition
+  out.push({
+    text: claim,
+    testQuestion: `Is the core factual proposition verified by independent, third-party corroboration?`,
+    category: cat,
+  });
+  out.push({
+    text: `Verification of operational scope, timeline, and reporting methodology for: ${claim}`,
+    testQuestion: `Does evidence document the specific geographic scope, baseline period, and accounting standard?`,
+    category: cat,
+  });
+
+  return out;
 }
 
 export function parseRelationJson(raw: unknown): RelationClassification {

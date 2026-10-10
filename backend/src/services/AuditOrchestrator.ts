@@ -28,6 +28,7 @@ import { detectGaps } from "../analysis/gaps.js";
 import { buildClaimEvents } from "../analysis/claimEvents.js";
 import { aggregateMetrics, computeIndicators } from "../scoring/integrity.js";
 import { calculateSpecificity } from "../scoring/specificity.js";
+import { checkEntityMatch } from "../analysis/evidenceMatcher.js";
 import { logger } from "../utils/logger.js";
 import { extractDomain, normalizeQuery } from "../utils/url.js";
 import { env, isMockMode } from "../config/env.js";
@@ -323,7 +324,9 @@ export class AuditOrchestrator {
       const sources = await this.execPlan(auditId, plan);
       collected.push(...sources);
       const last = store.must(auditId).requests.at(-1);
-      if (last?.status === "error") failed = last.error;
+      if (last && last.status !== "success" && last.status !== "cached" && last.status !== "no_results") {
+        failed = last.error || `Search query ${last.status.replace(/_/g, " ")}`;
+      }
     }
     const unique = dedupeSources(collected);
     if (failed && !unique.length) {
@@ -369,13 +372,13 @@ export class AuditOrchestrator {
     const clusterList = [...new Map([...clusters.values()].map((c) => [c.clusterId, c])).values()];
     const evidence: Evidence[] = [];
 
-    const relationInputs: Array<{ evidenceId: string; claim: string; title: string; snippet: string; sourceType: string; date: string | null }> = [];
+    const relationInputs: Array<{ evidenceId: string; claim: string; title: string; snippet: string; sourceType: string; date: string | null; companyName?: string }> = [];
     const evidenceMeta = new Map<string, { sub: Subclaim; claim: Claim; s: EvidenceSource; rel: number; clusterId: string | null }>();
     for (const sub of bundle.subclaims) {
       const claim = bundle.claims.find((c) => c.id === sub.claimId);
       if (!claim) continue;
       const ranked = uniqueSources
-        .map((s) => ({ s, rel: relevance(claim.text + " " + sub.text, s) }))
+        .map((s) => ({ s, rel: relevance(claim.text + " " + sub.text, s, bundle.company.name) }))
         .filter((x) => x.rel > 0.12)
         .sort((a, b) => b.rel - a.rel)
         .slice(0, bundle.audit.mode === "quick" ? 5 : 8);
@@ -383,7 +386,15 @@ export class AuditOrchestrator {
       for (const { s, rel } of ranked) {
         const cluster = clusters.get(s.id);
         const evidenceId = `E${relationInputs.length + 1}`;
-        relationInputs.push({ evidenceId, claim: `${claim.text} | ${sub.text}`, title: s.title, snippet: s.snippet, sourceType: s.sourceType, date: s.publishedAt });
+        relationInputs.push({
+          evidenceId,
+          claim: `${bundle.company.name}: ${claim.text} | ${sub.text}`,
+          title: s.title,
+          snippet: s.snippet,
+          sourceType: s.sourceType,
+          date: s.publishedAt,
+          companyName: bundle.company.name,
+        });
         evidenceMeta.set(evidenceId, { sub, claim, s, rel, clusterId: cluster?.clusterId ?? null });
       }
     }
@@ -425,28 +436,53 @@ export class AuditOrchestrator {
 
   private finalizeScores(auditId: string): void {
     const bundle = store.must(auditId);
+    const rawGaps = bundle.claims.map((c) =>
+      detectGaps(c, bundle.subclaims.filter((s) => s.claimId === c.id), bundle.evidence.filter((e) => e.claimId === c.id)),
+    );
+
     const claims = bundle.claims.map((claim) => {
       const ev = bundle.evidence.filter((e) => e.claimId === claim.id);
       const status = determineClaimStatus(ev);
-      const gap = detectGaps(claim, bundle.subclaims.filter((s) => s.claimId === claim.id), ev);
+      const gap = rawGaps.find((g) => g.claimId === claim.id) ?? detectGaps(claim, bundle.subclaims.filter((s) => s.claimId === claim.id), ev);
       const ind = computeIndicators(claim, ev, gap.missing);
-      const bullets = [
-        `${ev.filter((e) => e.relation === "SUPPORTING").length} supporting sources.`,
-        `${ev.filter((e) => e.relation === "CONTRADICTING").length} contradicting sources.`,
-        `${ev.filter((e) => e.sourceType !== "OFFICIAL_COMPANY").length} non-company sources.`,
-        gap.missing.length ? `Gaps: ${gap.missing.slice(0, 3).join("; ")}.` : "No major structured gaps flagged.",
-      ];
+
+      const supportCount = ev.filter((e) => e.relation === "SUPPORTING").length;
+      const conflictCount = ev.filter((e) => e.relation === "CONTRADICTING").length;
+      const independentCount = ev.filter((e) => e.sourceType !== "OFFICIAL_COMPANY" && e.relation === "SUPPORTING").length;
+      const officialCount = ev.filter((e) => e.sourceType === "OFFICIAL_COMPANY" && e.relation === "SUPPORTING").length;
+
+      let rationale = "";
+      if (status === "SUPPORTED") {
+        rationale = `Substantiated by ${independentCount} independent source(s) and ${officialCount} corporate disclosure(s) with no contradictory findings.`;
+      } else if (status === "PARTIALLY_SUPPORTED") {
+        if (officialCount > 0 && independentCount === 0) {
+          rationale = `Documented in official corporate disclosures (${officialCount} source(s)), but independent third-party verification was not retrieved.`;
+        } else {
+          rationale = `Partially substantiated with ${supportCount} supporting source(s); key verification requirements or subclaims remain unresolved.`;
+        }
+      } else if (status === "EVIDENCE_CONFLICT") {
+        rationale = `Identified ${conflictCount} contradictory or challenging source(s) regarding asserted figures or commitments.`;
+      } else {
+        rationale = `Insufficient public evidence retrieved to substantiate or refute the proposition.`;
+      }
+
+      if (gap.missing.length) {
+        rationale += ` Verification gaps: ${gap.missing.slice(0, 2).join("; ")}.`;
+      }
+
       return {
         ...claim,
         status,
         integrityScore: ind.integrity,
-        explanation: `EcoTrace reached ${status} because ${bullets.join(" ")} This is not a finding of wrongdoing.`,
+        explanation: `${rationale} (Evidence assessment, not a finding of wrongdoing).`,
       };
     });
+
     const subclaims = bundle.subclaims.map((s) => ({
       ...s,
       status: determineClaimStatus(bundle.evidence.filter((e) => e.subclaimId === s.id)),
     }));
+
     const gaps = claims.map((c) =>
       detectGaps(c, subclaims.filter((s) => s.claimId === c.id), bundle.evidence.filter((e) => e.claimId === c.id)),
     );
@@ -464,6 +500,7 @@ export class AuditOrchestrator {
       credits.remaining,
       attention ? Math.round(attention.relevanceScore * 100) : null,
       gaps.reduce((s, g) => s + g.missing.length, 0),
+      gaps,
     );
     store.updateAudit(auditId, { claims, subclaims, gaps, metrics, audit: { notes: bundle.audit.notes } });
     logger.info({ msg: "score_generated", auditId, integrity: metrics.claimIntegrity });
@@ -622,40 +659,130 @@ export function buildGraph(bundle: AuditBundle): EvidenceGraph {
 
 export function renderExport(bundle: AuditBundle): string {
   const { DISCLAIMER } = awaitDummy();
+  const metrics = bundle.metrics;
+  const credits = creditManager.snapshot(bundle.audit.id);
+
   const lines = [
-    `# EcoTrace Audit — ${bundle.company.name}`,
+    `# EcoTrace Audit Dossier — ${bundle.company.name}`,
     "",
-    `Date: ${bundle.audit.createdAt}`,
-    `Mode: ${bundle.audit.mode}`,
-    `Status: ${bundle.audit.status}`,
-    bundle.audit.mockMode ? "DATA: DEMO DATA (mock mode)" : "DATA: live SerpApi retrieval",
+    `**Audit Identifier:** \`${bundle.audit.id}\``,
+    `**Company:** ${bundle.company.name}${bundle.company.officialDomain ? ` (${bundle.company.officialDomain})` : ""}`,
+    `**Audit Mode:** ${bundle.audit.mode.toUpperCase()}`,
+    `**Audit Status:** ${bundle.audit.status.toUpperCase()}`,
+    `**Investigation Concluded:** ${bundle.audit.completedAt || bundle.audit.createdAt}`,
+    `**Data Surface:** ${bundle.audit.mockMode ? "DEMO FIXTURES (mock mode)" : "Live SerpApi multi-engine retrieval"}`,
     "",
-    "## Methodology",
-    "1. Claims discovered from public search",
-    "2. Claims decomposed into atomic subclaims",
-    "3. Queries generated for support and conflict",
-    "4. Evidence retrieved via SerpApi engines",
-    "5. Sources normalized and de-duplicated",
-    "6. Source independence estimated via clustering",
-    "7. Evidence relationships evaluated",
-    "8. Claim Integrity Indicator calculated (coverage, independence, consistency, freshness, specificity)",
+    "## 1. Executive Summary & Authoritative Metrics",
     "",
-    "## Metrics",
-    bundle.metrics ? JSON.stringify(bundle.metrics, null, 2) : "n/a",
+    "| Metric | Score | Authoritative Definition |",
+    "| :--- | :--- | :--- |",
+    `| **Claim Integrity** | ${metrics ? `${metrics.claimIntegrity}%` : "N/A"} | Weighted composite assessing coverage, source independence, consistency, freshness, and claim specificity. |`,
+    `| **Evidence Coverage** | ${metrics ? `${metrics.evidenceCoverage}%` : "N/A"} | Proportion of structured verification requirements addressed by distinct retrieved sources. |`,
+    `| **Source Independence** | ${metrics ? `${metrics.sourceIndependence}%` : "N/A"} | Corroboration from genuinely distinct non-corporate publishers, discounting duplicated and syndicated reporting. |`,
+    `| **Evidence Conflict** | ${metrics ? `${metrics.evidenceConflict}%` : "N/A"} | Proportion of polarized evidence contradicting claims. 0% means no qualifying conflict detected in retrieved evidence. |`,
+    `| **Claim Specificity** | ${metrics ? `${metrics.claimSpecificity}%` : "N/A"} | Density of quantifiable metrics, baselines, target years, and defined operational boundaries. |`,
+    `| **Evidence Gap** | ${metrics ? `${metrics.evidenceGap}%` : "N/A"} | Proportion of identified verification requirements unresolved by retrieved evidence. |`,
     "",
-    "## Claims",
+    "## 2. Search Budget & Retrieval Telemetry",
+    "",
+    `- **Search Credits Used:** ${credits.used}`,
+    `- **Search Credits Remaining:** ${credits.remaining}`,
+    `- **Estimated Search Budget:** ${credits.estimated}`,
+    `- **Cached Responses (0 credits):** ${credits.cached}`,
+    `- **Search Engines Engaged:** ${(metrics?.enginesUsed ?? []).join(", ") || "None"}`,
+    `- **Usable Evidence Records:** ${metrics?.evidenceCount ?? bundle.evidence.length}`,
+    `- **Distinct Publisher Domains:** ${metrics?.sourceCount ?? new Set(bundle.evidence.map(e => e.domain)).size}`,
+    "",
+    "## 3. Claim Register & Atomic Propositions",
+    "",
   ];
-  for (const c of bundle.claims) {
-    lines.push(`### ${c.text}`, `Status: ${c.status}`, `Integrity: ${c.integrityScore ?? "n/a"}`, c.explanation ?? "", "");
+
+  for (let i = 0; i < bundle.claims.length; i++) {
+    const c = bundle.claims[i];
+    const subs = bundle.subclaims.filter((s) => s.claimId === c.id);
     const ev = bundle.evidence.filter((e) => e.claimId === c.id);
-    for (const e of ev.slice(0, 8)) {
-      lines.push(`- [${e.relation}] ${e.title} (${e.sourceName}, ${e.engine}) — ${e.url}`);
-    }
     const gap = bundle.gaps.find((g) => g.claimId === c.id);
-    if (gap) lines.push(`Evidence gap: ${gap.requiredToSubstantiate}`);
+
+    lines.push(`### Claim ${i + 1}: ${c.text}`);
+    lines.push(`- **Category:** ${c.category}`);
+    lines.push(`- **Verdict:** ${c.status}`);
+    lines.push(`- **Claim Integrity Score:** ${c.integrityScore !== null ? `${c.integrityScore}%` : "N/A"}`);
+    lines.push(`- **Specificity Score:** ${Math.round(c.specificityScore * 100)}%`);
+    if (c.sourceName || c.sourceUrl) {
+      lines.push(`- **Provenance Source:** ${c.sourceName || c.sourceUrl} (${c.sourceUrl || "N/A"})`);
+    }
+    lines.push(`- **Investigative Assessment:** ${c.explanation || "N/A"}`);
     lines.push("");
+
+    if (subs.length) {
+      lines.push("#### Atomic Subclaims & Verification Criteria");
+      for (const s of subs) {
+        lines.push(`- **[${s.status}]** ${s.text}`);
+        lines.push(`  *Verification Test:* ${s.testQuestion}`);
+      }
+      lines.push("");
+    }
+
+    lines.push("#### Retrieved Evidence & Corroboration Ledger");
+    const supporting = ev.filter((e) => e.relation === "SUPPORTING");
+    const contradicting = ev.filter((e) => e.relation === "CONTRADICTING");
+    const mixedOrInsuff = ev.filter((e) => e.relation === "MIXED" || e.relation === "INSUFFICIENT");
+    const excluded = ev.filter((e) => e.relation === "IRRELEVANT");
+
+    if (ev.length === 0) {
+      lines.push("_No usable public evidence records retrieved for this claim proposition._");
+    } else {
+      if (supporting.length) {
+        lines.push("**Supporting Evidence:**");
+        for (const e of supporting) {
+          lines.push(`- **[SUPPORTING]** [${e.title}](${e.url})`);
+          lines.push(`  *Publisher:* ${e.sourceName} (${e.domain}) | *Source Type:* ${e.sourceType} | *Engine:* ${e.engine} | *Date:* ${e.publishedAt || "Undated"}`);
+          lines.push(`  *Assessment:* ${e.explanation}`);
+        }
+      }
+      if (contradicting.length) {
+        lines.push("**Contradicting / Challenging Evidence:**");
+        for (const e of contradicting) {
+          lines.push(`- **[CONTRADICTING]** [${e.title}](${e.url})`);
+          lines.push(`  *Publisher:* ${e.sourceName} (${e.domain}) | *Source Type:* ${e.sourceType} | *Engine:* ${e.engine} | *Date:* ${e.publishedAt || "Undated"}`);
+          lines.push(`  *Assessment:* ${e.explanation}`);
+        }
+      }
+      if (mixedOrInsuff.length) {
+        lines.push("**Insufficient / Contextual Material:**");
+        for (const e of mixedOrInsuff) {
+          lines.push(`- **[${e.relation}]** [${e.title}](${e.url})`);
+          lines.push(`  *Publisher:* ${e.sourceName} (${e.domain}) | *Source Type:* ${e.sourceType} | *Assessment:* ${e.explanation}`);
+        }
+      }
+      if (excluded.length) {
+        lines.push("**Excluded Items (Irrelevant or Entity Mismatch):**");
+        for (const e of excluded) {
+          lines.push(`- **[EXCLUDED]** [${e.title}](${e.url}) — Reason: ${e.explanation}`);
+        }
+      }
+    }
+    lines.push("");
+
+    if (gap && gap.missing?.length) {
+      lines.push("#### Evidence Gaps & Substantiation Requirements");
+      lines.push(gap.requiredToSubstantiate);
+      for (const m of gap.missing) {
+        lines.push(`- *Missing:* ${m}`);
+      }
+      lines.push("");
+    }
   }
-  lines.push("## Disclaimer", DISCLAIMER);
+
+  lines.push("## 4. Methodology & Limitations");
+  lines.push("EcoTrace evaluates corporate environmental statements through systematic proposition decomposition, multi-engine public retrieval, publisher independence clustering, and deterministic indicator aggregation.");
+  lines.push("- **Claim Integrity** is an empirical measure of evidence quality, not an absolute probability of factual truth.");
+  lines.push("- **Evidence Conflict = 0%** indicates no qualifying contradictions were detected in retrieved search samples; it is not proof that the proposition is universally true.");
+  lines.push("- **Search Gaps** represent information not located within the allocated budget, not proof of wrongdoing.");
+  lines.push("");
+  lines.push("## 5. Disclaimer");
+  lines.push(DISCLAIMER);
+
   return lines.join("\n");
 }
 
@@ -684,7 +811,11 @@ function dedupeSources(sources: EvidenceSource[]): EvidenceSource[] {
   return out;
 }
 
-function relevance(claim: string, s: EvidenceSource): number {
+function relevance(claim: string, s: EvidenceSource, companyName?: string): number {
+  if (companyName) {
+    const entityCheck = checkEntityMatch(companyName, s.title, s.snippet);
+    if (!entityCheck.matches) return 0;
+  }
   const a = new Set(normalizeQuery(claim).split(" ").filter((w) => w.length > 3));
   const b = new Set(normalizeQuery(`${s.title} ${s.snippet}`).split(" ").filter((w) => w.length > 3));
   let inter = 0;

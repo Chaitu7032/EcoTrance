@@ -186,25 +186,30 @@ export function ClaimPage() {
 
           <div className="space-y-3">
             {evidence.map((item) => {
+              const isExcluded = item.relation === "IRRELEVANT";
               const relColor =
                 item.relation === "SUPPORTING"
                   ? "border-emerald-800/60 bg-emerald-950/40 text-emerald-300"
                   : item.relation === "CONTRADICTING"
                   ? "border-rose-800/60 bg-rose-950/40 text-rose-300"
+                  : isExcluded
+                  ? "border-amber-900/60 bg-amber-950/30 text-amber-300"
                   : "border-stone-700/60 bg-stone-900/60 text-stone-300";
 
               return (
                 <article
                   key={item.id}
-                  className="rounded border border-[#22303a] bg-[#121a20] p-5 text-xs transition-colors hover:border-[#384d5c]"
+                  className={`rounded border bg-[#121a20] p-5 text-xs transition-colors hover:border-[#384d5c] ${
+                    isExcluded ? "border-amber-900/40 opacity-75" : "border-[#22303a]"
+                  }`}
                 >
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className={`rounded px-1.5 py-0.5 font-mono text-[10px] uppercase font-medium border ${relColor}`}>
-                        {item.relation}
+                        {isExcluded ? "EXCLUDED (IRRELEVANT)" : item.relation}
                       </span>
                       <span className="rounded border border-[#22303a] bg-[#0c1216] px-1.5 py-0.5 font-mono text-[10px] text-[#8e99a2]">
-                        {item.sourceType}
+                        {item.sourceType === "OFFICIAL_COMPANY" ? "COMPANY SELF-REPORTING" : item.sourceType}
                       </span>
                       <span className="rounded border border-[#22303a] bg-[#0c1216] px-1.5 py-0.5 font-mono text-[10px] text-[#8e99a2]">
                         {item.engine}
